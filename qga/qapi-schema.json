@@ -374,6 +374,67 @@
   'returns': 'GuestFsfreezeStatus' }
 
 ##
+# @GuestFsfreezeBusType
+#
+# An enumeration of bus type to specify disks to be frozen
+#
+# @ide: IDE disks
+# @fdc: floppy disks
+# @scsi: SCSI disks
+# @virtio: virtio disks
+# @xen: Xen disks
+# @usb: USB disks
+# @uml: UML disks
+# @sata: SATA disks
+# @sd: SD cards
+#
+# Since: 2.0
+##
+{ 'enum': 'GuestFsfreezeBusType',
+  'data': [ 'ide', 'fdc', 'scsi', 'virtio', 'xen', 'usb', 'uml', 'sata',
+            'sd' ] }
+
+##
+# @GuestFsfreezePCIAddress:
+#
+# @domain: domain id
+# @bus: bus id
+# @slot: slot id
+# @function: function id
+#
+# Since: 2.0
+##
+{ 'type': 'GuestFsfreezePCIAddress',
+  'data': {'domain': 'int', 'bus': 'int',
+           'slot': 'int', 'function': 'int'} }
+
+##
+# @GuestFsfreezeDriveAddress:
+#
+# @pci-controller: controller's PCI address
+# @bus: bus id
+# @target: target id
+# @unit: unit id
+#
+# Since: 2.0
+##
+{ 'type': 'GuestFsfreezeDriveAddress',
+  'data': {'pci-controller': 'GuestFsfreezePCIAddress',
+           'bus': 'int', 'target': 'int', 'unit': 'int'} }
+
+##
+# @GuestFsfreezeDisk:
+#
+# @bus: bus type
+# @address: disk address
+#
+# Since: 2.0
+##
+{ 'type': 'GuestFsfreezeDisk',
+  'data': {'bus': 'GuestFsfreezeBusType',
+           'address': 'GuestFsfreezeDriveAddress'} }
+
+##
 # @guest-fsfreeze-freeze:
 #
 # Sync and freeze all freezable, local guest filesystems
@@ -384,6 +445,7 @@
 # Since: 0.15.0
 ##
 { 'command': 'guest-fsfreeze-freeze',
+  'data':    { '*disks': ['GuestFsfreezeDisk'] },
   'returns': 'int' }
 
 ##

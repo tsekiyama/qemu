@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -572,6 +573,7 @@ static void guest_file_init(void)
 typedef struct FsMount {
     char *dirname;
     char *devtype;
+    unsigned int devmajor, devminor;
     QTAILQ_ENTRY(FsMount) next;
 } FsMount;
 
@@ -596,12 +598,14 @@ static void free_fs_mount_list(FsMountList *mounts)
 /*
  * Walk the mount table and build a list of local file systems
  */
-static void build_fs_mount_list(FsMountList *mounts, Error **err)
+static void build_fs_mount_list_from_mtab(FsMountList *mounts, Error **err)
 {
     struct mntent *ment;
     FsMount *mount;
     char const *mtab = "/proc/self/mounts";
     FILE *fp;
+    unsigned int devmajor, devminor;
+    struct stat st;
 
     fp = setmntent(mtab, "r");
     if (!fp) {
@@ -622,18 +626,315 @@ static void build_fs_mount_list(FsMountList *mounts, Error **err)
             continue;
         }
 
+        devmajor = devminor = 0;
+        if (stat(ment->mnt_fsname, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                /* It looks like bind mount */
+                continue;
+            }
+            if (S_ISBLK(st.st_mode)) {
+                devmajor = major(st.st_dev);
+                devminor = minor(st.st_dev);
+            }
+        }
+
         mount = g_malloc0(sizeof(FsMount));
         mount->dirname = g_strdup(ment->mnt_dir);
         mount->devtype = g_strdup(ment->mnt_type);
+        mount->devmajor = devmajor;
+        mount->devminor = devminor;
 
         QTAILQ_INSERT_TAIL(mounts, mount, next);
     }
 
     endmntent(fp);
 }
+
+static void decode_mntname(char *name, int len)
+{
+    int i, j = 0;
+    for (i = 0; i <= len; i++) {
+        if (name[i] != '\\') {
+            name[j++] = name[i];
+        } else if (name[i+1] == '\\') {
+            name[j++] = '\\';
+            i++;
+        } else if (name[i+1] == '0' && name[i+2] == '4' && name[i+3] == '0') {
+            name[j++] = ' ';
+            i += 3;
+        } else if (name[i+1] == '0' && name[i+2] == '1' && name[i+3] == '1') {
+            name[j++] = '\t';
+            i += 3;
+        } else if (name[i+1] == '0' && name[i+2] == '1' && name[i+3] == '2') {
+            name[j++] = '\n';
+            i += 3;
+        } else if (name[i+1] == '1' && name[i+2] == '3' && name[i+3] == '4') {
+            name[j++] = '\\';
+            i += 3;
+        } else {
+            name[j++] = name[i];
+        }
+    }
+}
+
+static void build_fs_mount_list(FsMountList *mounts, Error **err)
+{
+    FsMount *mount;
+    char const *mountinfo = "/proc/self/mountinfo";
+    FILE *fp;
+    char *line = NULL;
+    size_t n;
+    unsigned int devmajor, devminor;
+    int ret, dir_s, dir_e, type_s, type_e;
+
+    fp = fopen(mountinfo, "r");
+    if (!fp) {
+        build_fs_mount_list_from_mtab(mounts, err);
+        return;
+    }
+
+    while (getline(&line, &n, fp) != -1) {
+        ret = sscanf(line, "%*u %*u %u:%u %*s %n%*s%n %*s %*s %*s %n%*s%n",
+                     &devmajor, &devminor, &dir_s, &dir_e, &type_s, &type_e);
+        if (ret < 2 || devmajor == 0) {
+            continue;
+        }
+        line[dir_e] = 0;
+        line[type_e] = 0;
+        decode_mntname(line+dir_s, dir_e-dir_s);
+
+        mount = g_malloc0(sizeof(FsMount));
+        mount->dirname = g_strdup(line+dir_s);
+        mount->devtype = g_strdup(line+type_s);
+        mount->devmajor = devmajor;
+        mount->devminor = devminor;
+
+        QTAILQ_INSERT_TAIL(mounts, mount, next);
+    }
+    free(line);
+
+    fclose(fp);
+}
 #endif
 
 #if defined(CONFIG_FSFREEZE)
+
+static int compare_uint(const void *_a, const void *_b)
+{
+    unsigned int a = *(unsigned int *)_a;
+    unsigned int b = *(unsigned int *)_b;
+
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/* Walk the specified sysfs path and build a sorted list of ata port numbers. */
+static int get_ata_ports(char const *syspath, char const *ata,
+                         unsigned int *ports, int ports_max, Error **err)
+{
+    char *path;
+    DIR *dir;
+    struct dirent *entry;
+    int i = 0;
+
+    path = g_strndup(syspath, ata - syspath);
+    dir = opendir(path);
+    if (!dir) {
+        error_setg_errno(err, errno, "opendir(\"%s\")", path);
+        g_free(path);
+        return -1;
+    }
+
+    while (i < ports_max) {
+        entry = readdir(dir);
+        if (!entry) {
+            break;
+        }
+        if (sscanf(entry->d_name, "ata%d", ports+i) == 1) {
+            ++i;
+        }
+    }
+
+    qsort(ports, i, sizeof(ports[0]), compare_uint);
+
+    g_free(path);
+    closedir(dir);
+    return i;
+}
+
+/* Return true if the device specified by @syspath is contained in @disks. */
+static bool __check_mount_in_disks(char const *syspath,
+                                   GuestFsfreezeDiskList *disks, Error **err)
+{
+    GuestFsfreezeDiskList *disk;
+    unsigned int pci[4], ata, tgt[3], ports[8];
+    int nports = 0;
+    GuestFsfreezePCIAddress *pciaddr;
+    GuestFsfreezeDriveAddress *drive;
+    bool has_ata = false, has_tgt = false;
+    char *p;
+
+    p = strstr(syspath, "/devices/pci");
+    if (!p ||
+        sscanf(p+12, "%*x:%*x/%x:%x:%x.%x", pci, pci+1, pci+2, pci+3) < 4) {
+        slog("only pci device is supported: sysfs path \"%s\"", syspath);
+        return false;
+    }
+
+    p = strstr(syspath, "/target");
+    if (p && sscanf(p+7, "%*u:%*u:%*u/%*u:%u:%u:%u", tgt, tgt+1, tgt+2) == 3) {
+        has_tgt = true;
+    }
+
+    p = strstr(syspath, "/ata");
+    if (p && sscanf(p+4, "%u", &ata) == 1) {
+        has_ata = true;
+    }
+
+    for (disk = disks; disk; disk = disk->next) {
+        drive = disk->value->address;
+        pciaddr = drive->pci_controller;
+
+        if (pci[0] != pciaddr->domain || pci[1] != pciaddr->bus ||
+            pci[2] != pciaddr->slot || pci[3] != pciaddr->function) {
+            continue;
+        }
+
+        switch (disk->value->bus) {
+        case GUEST_FSFREEZE_BUS_TYPE_IDE:
+            /* an ata port per ide bus, target*:0:<unit>:0 */
+            if (!has_ata || !has_tgt) {
+                break;
+            }
+            nports = get_ata_ports(syspath, p, ports,
+                                   sizeof(ports)/sizeof(ports[0]), err);
+            if (nports < 0) {
+                return false;
+            }
+            if (nports > drive->bus && ata == ports[drive->bus] &&
+                tgt[1] == drive->unit) {
+                return true;
+            }
+            break;
+
+        case GUEST_FSFREEZE_BUS_TYPE_SCSI:
+            if (!has_tgt) {
+                break;
+            }
+            if (strstr(syspath, "/virtio")) {
+                /* virtio-scsi: target*:0:0:<unit> */
+                if (tgt[2] == drive->unit) {
+                    return true;
+                }
+            } else {
+                /* scsi(LSI Logic): target*:0:<unit>:0 */
+                if (tgt[1] == drive->unit) {
+                    return true;
+                }
+            }
+            break;
+
+        case GUEST_FSFREEZE_BUS_TYPE_VIRTIO:
+            /* 1 disk per 1 device; no further check is required */;
+            return true;
+
+        case GUEST_FSFREEZE_BUS_TYPE_SATA:
+            /* an ata port per unit */
+            if (!has_ata || !has_tgt) {
+                break;
+            }
+            nports = get_ata_ports(syspath, p, ports,
+                                   sizeof(ports)/sizeof(ports[0]), err);
+            if (nports < 0) {
+                return false;
+            }
+            if (nports > drive->unit && ata == ports[drive->unit]) {
+                return true;
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+static bool _check_mount_in_disks(char const *dirpath,
+                                  GuestFsfreezeDiskList *disks, Error **err);
+
+/* Return true if some of slave devices of virtual volume specified by @syspath
+ * are listed in @disks */
+static bool check_virtual_devices(char const *syspath,
+                                  GuestFsfreezeDiskList *disks, Error **err)
+{
+    bool ret = false;
+    DIR *dir;
+    char *dirpath;
+    struct dirent *entry;
+
+    dirpath = g_strdup_printf("%s/slaves", syspath);
+    dir = opendir(dirpath);
+    if (!dir) {
+        error_setg_errno(err, errno, "opendir(\"%s\")", dirpath);
+        g_free(dirpath);
+        return false;
+    }
+    g_free(dirpath);
+
+    while (!ret) {
+        entry = readdir(dir);
+        if (!entry) {
+            break;
+        }
+
+        if (entry->d_type == DT_LNK) {
+            dirpath = g_strdup_printf("%s/slaves/%s", syspath, entry->d_name);
+            ret = _check_mount_in_disks(dirpath, disks, err);
+            g_free(dirpath);
+
+            if (error_is_set(err)) {
+                break;
+            }
+        }
+    }
+
+    closedir(dir);
+    return ret;
+}
+
+static bool _check_mount_in_disks(char const *dirpath,
+                                  GuestFsfreezeDiskList *disks, Error **err)
+{
+    char *syspath = realpath(dirpath, NULL);
+    bool ret;
+
+    if (!syspath) {
+        error_setg_errno(err, errno, "realpath(\"%s\")", dirpath);
+        return false;
+    }
+
+    if (strstr(syspath, "/devices/virtual/block/")) {
+        ret = check_virtual_devices(syspath, disks, err);
+    } else {
+        ret = __check_mount_in_disks(syspath, disks, err);
+    }
+
+    free(syspath);
+    return ret;
+}
+
+/* Return true if @mount is on the disk device(s) listed in @disks. */
+static bool check_mount_in_disks(struct FsMount *mount,
+                                 GuestFsfreezeDiskList *disks, Error **err)
+{
+    char *dirpath = g_strdup_printf("/sys/dev/block/%u:%u",
+                                    mount->devmajor, mount->devminor);
+    bool ret = _check_mount_in_disks(dirpath, disks, err);
+
+    g_free(dirpath);
+    return ret;
+}
+
 
 typedef enum {
     FSFREEZE_HOOK_THAW = 0,
@@ -711,7 +1012,8 @@ GuestFsfreezeStatus qmp_guest_fsfreeze_status(Error **err)
  * Walk list of mounted file systems in the guest, and freeze the ones which
  * are real local file systems.
  */
-int64_t qmp_guest_fsfreeze_freeze(Error **err)
+int64_t qmp_guest_fsfreeze_freeze(bool has_disks,
+                                  GuestFsfreezeDiskList *disks, Error **err)
 {
     int ret = 0, i = 0;
     FsMountList mounts;
@@ -738,6 +1040,13 @@ int64_t qmp_guest_fsfreeze_freeze(Error **err)
     ga_set_frozen(ga_state);
 
     QTAILQ_FOREACH_REVERSE(mount, &mounts, FsMountList, next) {
+        if (has_disks && !check_mount_in_disks(mount, disks, err)) {
+            if (error_is_set(err)) {
+                goto error;
+            }
+            continue;
+        }
+
         fd = qemu_open(mount->dirname, O_RDONLY);
         if (fd == -1) {
             error_setg_errno(err, errno, "failed to open %s", mount->dirname);

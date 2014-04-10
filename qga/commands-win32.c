@@ -173,7 +173,8 @@ GuestFsfreezeStatus qmp_guest_fsfreeze_status(Error **err)
  * Freeze local file systems using Volume Shadow-copy Service.
  * The frozen state is limited for up to 10 seconds by VSS.
  */
-int64_t qmp_guest_fsfreeze_freeze(Error **err)
+int64_t qmp_guest_fsfreeze_freeze(bool has_disks,
+                                  GuestFsfreezeDiskList *disks, Error **err)
 {
     int i;
     Error *local_err = NULL;
